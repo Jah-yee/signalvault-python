@@ -7,7 +7,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
-## [0.5.0] — Unreleased
+## [0.5.0] — 2026-09-28
 
 Security and reliability release.
 
