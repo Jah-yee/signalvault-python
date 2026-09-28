@@ -14,7 +14,7 @@ Security and reliability release.
 ### Breaking changes
 
 - **Default `base_url` is now `https://api.signalvault.io`** (was `http://localhost:4000`). Pass `base_url` explicitly for local development.
-- **Plain `http://` base URLs are refused** except for `localhost`, `127.0.0.1` and `::1`, because the API key and prompts would travel unencrypted.
+- **Plain `http://` base URLs are refused** except for `localhost`, `127.0.0.1` and `::1`, because the API key and prompts would travel unencrypted. A `base_url` with a query string or fragment is refused too.
 - **`metadata=` is no longer taken over by SignalVault.** It is passed through to the provider (OpenAI's `metadata`, Anthropic's `metadata={"user_id": ...}`). Use `sv_metadata=` for SignalVault metadata; the `metadata` fallback was deprecated in 0.3.0.
 - **Blocked requests raise `SignalVaultBlockedError`** (a `RuntimeError` subclass) with `violations`, `request_id` and `dashboard_url`. The message lists violation types instead of the full violation dicts.
 - **`Decision.redactions`** is a list of `{"type", "count"}` dicts, matching the API.
@@ -25,10 +25,12 @@ Security and reliability release.
 - New `fail_mode="open" | "closed"`. With `"closed"`, the SDK raises `SignalVaultUnavailableError` instead of calling the provider unchecked. Default stays `"open"`.
 - The Anthropic `system` prompt is now included in the pre-flight scan and the audit record.
 - HTTP clients never follow redirects, so the API key is never re-sent to another URL.
+- When the pre-flight check could not be completed (unreachable, timeout, 5xx, invalid response) and the request went ahead unchecked, the request is now recorded in the background, marked `preflight_unavailable`. Previously only the response was sent, which the API rejects, so these calls were missing from the audit log. After a refused check (401/402/403/429) no audit events are sent.
+- `SignalVaultWarning` is reported at the caller's line and repeats after the one-minute window. Previously Python's default warning filter showed each message only once per process, so a later outage could go unreported.
 
 ### Fixes
 
-- A 200 pre-flight response with a non-JSON body no longer raises `JSONDecodeError` into the caller.
+- A 200 pre-flight response with a non-JSON body, or with wrongly typed fields (for example a non-string `decision` or non-list `violations`), no longer raises into the caller.
 - Deeply nested tool inputs no longer raise `RecursionError`; nesting beyond 100 levels is replaced with `"[MaxDepth]"`.
 - Tool-call events are built when the tool returns, so later mutation of the arguments no longer changes what is recorded. An invalid tool name no longer breaks the wrapped tool.
 - Async clients keep references to background tasks, so audit events are no longer lost to garbage collection. Scheduling without a running loop now warns instead of dropping silently.
@@ -37,7 +39,7 @@ Security and reliability release.
 ### Added
 
 - `flush()` on sync clients and `await flush()` on async clients; `close()` / `aclose()` now send queued events first.
-- Every background event carries an `event_id`; the SDK retries once on network errors and 5xx, and on 429 when `Retry-After` is 5 seconds or less.
+- Every background event carries an `event_id`. The SDK retries once on connection errors and 5xx (not timeouts, so a slow server holds a worker for at most one `timeout` per event), and on 429 only when `Retry-After` is 5 seconds or less, which the SignalVault API does not currently send. `tools.record()` does not retry; its events also carry an `event_id`.
 - `Accept: application/json` and `User-Agent: signalvault-python/<version>` headers.
 - LICENSE file.
 

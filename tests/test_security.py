@@ -350,3 +350,157 @@ def test_deep_nesting_does_not_raise():
         cur = cur["a"]
     result = sanitize_payload(value)
     assert "[MaxDepth]" in json.dumps(result)
+
+
+# ---------------------------------------------------------------------------
+# Review follow-ups
+# ---------------------------------------------------------------------------
+
+class TestMalformedDecisions:
+    @pytest.mark.parametrize("body", [
+        {"decision": ["block"]},
+        {"decision": {}},
+        {"decision": "allow", "violations": 5},
+    ])
+    def test_wrong_types_fail_open_instead_of_raising(self, body):
+        server = Server({"ai.request": [{"status": 200, "json": body}]})
+        client = sync_client(server)
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            client.chat.completions.create(model="m", messages=MESSAGES)
+        client._openai.chat.completions.create.assert_called_once()
+
+    def test_non_string_violation_type_in_block(self):
+        server = Server({"ai.request": [{"status": 200, "json": {
+            "decision": "block", "violations": [{"type": 7}, "junk", {"type": "pii"}],
+        }}]})
+        client = sync_client(server)
+        with pytest.raises(SignalVaultBlockedError, match=r"\(7, pii\)"):
+            client.chat.completions.create(model="m", messages=MESSAGES)
+
+
+class TestWarningsRepeat:
+    def test_repeats_after_the_window_under_default_filters(self, monkeypatch):
+        import signalvault.client as client_module
+
+        monkeypatch.setattr(client_module, "_WARN_INTERVAL_SECONDS", 0.0)
+        server = Server({"ai.request": [{"status": 401, "json": {}} for _ in range(3)]})
+        client = sync_client(server)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("default")
+            for _ in range(3):
+                client._send_request("r", {"model": "m", "messages": []}, {})
+        assert len(caught) == 3
+
+    def test_points_at_the_callers_code(self):
+        server = Server({"ai.request": [{"status": 401, "json": {}}]})
+        client = sync_client(server)
+        with pytest.warns(SignalVaultWarning) as record:
+            client.chat.completions.create(model="m", messages=MESSAGES)
+        assert record[0].filename == __file__
+
+
+class TestRetryPolicy:
+    def test_warns_when_the_retry_is_rate_limited_too(self):
+        server = Server({
+            "ai.request": [ALLOW],
+            "ai.response": [
+                {"status": 429, "headers": {"retry-after": "0"}},
+                {"status": 429, "headers": {"retry-after": "60"}},
+            ],
+        })
+        client = sync_client(server)
+        with pytest.warns(SignalVaultWarning, match="being dropped"):
+            client.chat.completions.create(model="m", messages=MESSAGES)
+            client.flush()
+        assert server.types().count("ai.response") == 2
+
+    def test_timeouts_are_not_retried(self):
+        attempts = []
+
+        def handler(request):
+            attempts.append(json.loads(request.content)["type"])
+            raise httpx.ReadTimeout("slow", request=request)
+
+        client = SignalVaultClient(api_key="k", openai_api_key="x")
+        client._http = httpx.Client(transport=httpx.MockTransport(handler))
+        client._fire_response("r", "m", "out", 1, 1, {})
+        client.flush()
+        assert attempts == ["ai.response"]
+
+    def test_manual_tool_record_does_not_retry(self):
+        server = Server({"agent.tool_call": [{"status": 503}, {"status": 200}]})
+        client = sync_client(server)
+        client.tools.record(tool_name="t", duration_ms=1)
+        assert server.types() == ["agent.tool_call"]
+
+
+class TestAuditWhenPreflightFailed:
+    def test_records_the_request_before_the_response_on_503(self):
+        server = Server({"ai.request": [{"status": 503}]})
+        client = sync_client(server)
+        with pytest.warns(SignalVaultWarning):
+            client.chat.completions.create(model="m", messages=MESSAGES)
+        client.flush()
+
+        assert server.types() == ["ai.request", "ai.request", "ai.response"]
+        fallback = server.bodies[1]
+        assert fallback["request_id"] == server.bodies[0]["request_id"]
+        assert "event_id" not in fallback
+        assert fallback["payload"] == {"messages": MESSAGES, "preflight_unavailable": True}
+
+    def test_no_audit_events_after_a_refused_preflight(self):
+        server = Server({"ai.request": [{"status": 401, "json": {}}]})
+        client = sync_client(server)
+        with pytest.warns(SignalVaultWarning):
+            client.chat.completions.create(model="m", messages=MESSAGES)
+        client.flush()
+        assert server.types() == ["ai.request"]
+
+    @pytest.mark.asyncio
+    async def test_async_records_the_request_on_network_error(self):
+        calls = []
+
+        async def handler(request):
+            body = json.loads(request.content)
+            calls.append(body)
+            if len(calls) == 1:
+                raise httpx.ConnectError("down", request=request)
+            return httpx.Response(200, json={})
+
+        client = AsyncSignalVaultClient(api_key="k", openai_api_key="x")
+        client._http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        client._openai = MagicMock()
+
+        async def create(**_):
+            return fake_completion()
+
+        client._openai.chat.completions.create = create
+        with pytest.warns(SignalVaultWarning, match="unreachable"):
+            await client.chat.completions.create(model="m", messages=MESSAGES)
+        await client.flush()
+        assert [c["type"] for c in calls] == ["ai.request", "ai.request", "ai.response"]
+        assert calls[1]["payload"]["preflight_unavailable"] is True
+
+
+class TestFailureClassification:
+    def test_redirect_is_reported_as_a_base_url_problem(self):
+        server = Server({"ai.request": [{"status": 307, "headers": {"location": "https://elsewhere"}}]})
+        client = sync_client(server)
+        with pytest.warns(SignalVaultWarning, match=r"redirected \(307\).*base_url"):
+            client.chat.completions.create(model="m", messages=MESSAGES)
+
+    def test_fail_closed_on_network_error(self):
+        def handler(request):
+            raise httpx.ConnectError("down", request=request)
+
+        client = sync_client(Server(), fail_mode="closed")
+        client._http = httpx.Client(transport=httpx.MockTransport(handler))
+        with pytest.raises(SignalVaultUnavailableError, match="unreachable"):
+            client.chat.completions.create(model="m", messages=MESSAGES)
+        client._openai.chat.completions.create.assert_not_called()
+
+    def test_base_url_with_query_or_fragment_is_refused(self):
+        for bad in ("https://api.signalvault.io?x=1", "https://api.signalvault.io#frag"):
+            with pytest.raises(ValueError, match="query or fragment"):
+                normalize_base_url(bad)

@@ -7,8 +7,10 @@ import atexit
 import concurrent.futures
 import functools
 import inspect
+import os
 import platform
 import random
+import sys
 import threading
 import time
 import traceback
@@ -39,6 +41,30 @@ _MAX_RETRY_AFTER_SECONDS = 5.0
 _WARN_INTERVAL_SECONDS = 60.0
 _DECISIONS = {"allow", "warn", "block", "redact"}
 _FAIL_MODES = {"open", "closed"}
+# Pre-flight failures where re-sending the ai.request later can succeed.
+_RECORDABLE_CAUSES = {"timeout", "network", "5xx", "invalid-response"}
+# Passed as the fallback when no audit events should be sent at all.
+_NO_AUDIT: Any = object()
+_PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _emit_warning(message: str, category: type = UserWarning) -> None:
+    """Warns from the first stack frame outside this package, every time.
+
+    ``warnings.warn`` would report from a line inside the SDK, and Python's
+    default filter shows a given message from a given line only once per
+    process — so a second outage hours later would be silent. A fresh
+    registry per call avoids that; callers rate-limit instead.
+    """
+    frame = sys._getframe(1)
+    while frame is not None and os.path.abspath(frame.f_code.co_filename).startswith(_PACKAGE_DIR + os.sep):
+        frame = frame.f_back
+    if frame is None:
+        filename, lineno, module = "<signalvault>", 0, "signalvault"
+    else:
+        filename, lineno = frame.f_code.co_filename, frame.f_lineno
+        module = frame.f_globals.get("__name__", "")
+    warnings.warn_explicit(message, category, filename, lineno, module=module, registry={})
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +107,10 @@ class Decision:
     # provider is not modified. Check len(), never truthiness.
     redactions: List[Dict[str, Any]] = field(default_factory=list)
     dashboard_url: Optional[str] = None
+    # Set when no decision was obtained: "record" if the server may not have
+    # stored the request (network, timeout, 5xx, invalid response), "skip" if
+    # it refused it (401/402/403/429/3xx). Internal.
+    _preflight_failed: Optional[str] = field(default=None, repr=False, compare=False)
 
 
 class SignalVaultWarning(UserWarning):
@@ -97,7 +127,7 @@ class SignalVaultBlockedError(RuntimeError):
     def __init__(
         self, request_id: str, violations: List[Violation], dashboard_url: Optional[str] = None,
     ) -> None:
-        types = ", ".join(dict.fromkeys(v.type for v in violations if v.type)) or "policy"
+        types = ", ".join(dict.fromkeys(str(v.type) for v in violations if v.type)) or "policy"
         super().__init__(f"[SignalVault] Request blocked by guardrails ({types}).")
         self.request_id = request_id
         self.violations = violations
@@ -137,6 +167,8 @@ def normalize_base_url(raw: str) -> str:
     parsed = urlparse(raw)
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         raise ValueError(f"[SignalVault] base_url must be an https:// URL, got {raw!r}")
+    if parsed.query or parsed.fragment:
+        raise ValueError(f"[SignalVault] base_url must not contain a query or fragment, got {raw!r}")
     if parsed.scheme == "http" and parsed.hostname not in _LOCAL_HOSTS:
         raise ValueError(
             "[SignalVault] base_url must use https:// (plain http:// is only allowed for "
@@ -173,7 +205,7 @@ def _parse_decision(data: dict) -> Decision:
     known = Violation.__dataclass_fields__
     violations = [
         Violation(**{k: v for k, v in item.items() if k in known})
-        for item in data.get("violations") or []
+        for item in (data.get("violations") if isinstance(data.get("violations"), list) else [])
         if isinstance(item, dict)
     ]
     redactions = data.get("redactions")
@@ -210,9 +242,9 @@ def _anthropic_output_text(response: Any) -> str:
 
 
 def _retry_delay(resp: Optional[httpx.Response]) -> Optional[float]:
-    """Seconds to wait before one retry, or None if the event should not be retried."""
+    """Seconds to wait before retrying a failed response once, or None for no retry."""
     if resp is None:
-        return 0.25 + random.random() * 0.5
+        return None
     if resp.status_code == 429:
         try:
             retry_after = float(resp.headers.get("retry-after"))
@@ -281,7 +313,7 @@ class _ClientCommon:
             if last is not None and now - last < _WARN_INTERVAL_SECONDS:
                 return
             self._last_warned[key] = now
-        warnings.warn(message, SignalVaultWarning, stacklevel=4)
+        _emit_warning(message, SignalVaultWarning)
 
     def _unavailable(
         self, request_id: str, key: str, reason: str, status: Optional[int] = None,
@@ -294,7 +326,22 @@ class _ClientCommon:
             f"[SignalVault] {reason}. Guardrails were NOT applied — requests are being sent "
             f"to the provider unchecked (fail_mode='open').",
         )
-        return Decision()
+        return Decision(_preflight_failed="record" if key in _RECORDABLE_CAUSES else "skip")
+
+    def _fallback_request(self, decision: Decision, request_id: str, params: dict, metadata: dict) -> Any:
+        """What to send before the response when the pre-flight got no decision.
+
+        None: the pre-flight was recorded normally. ``_NO_AUDIT``: the server
+        refused it, so a response event would be refused too. Otherwise the
+        ai.request body, so an unchecked call still reaches the audit log.
+        """
+        if decision._preflight_failed is None:
+            return None
+        if decision._preflight_failed == "skip":
+            return _NO_AUDIT
+        body = self._preflight_body(request_id, params, metadata)
+        body["payload"]["preflight_unavailable"] = True
+        return body
 
     def _preflight_body(self, request_id: str, params: dict, metadata: dict) -> dict:
         return {
@@ -315,7 +362,8 @@ class _ClientCommon:
             data = resp.json()
         except ValueError:
             return self._unavailable(request_id, "invalid-response", "SignalVault returned an invalid response")
-        if not isinstance(data, dict) or data.get("decision") not in _DECISIONS:
+        decision = data.get("decision") if isinstance(data, dict) else None
+        if not isinstance(decision, str) or decision not in _DECISIONS:
             return self._unavailable(request_id, "invalid-response", "SignalVault returned an invalid decision")
         return _parse_decision(data)
 
@@ -359,8 +407,9 @@ class _ClientCommon:
     def _log_undelivered(self, resp: Optional[httpx.Response]) -> None:
         if resp is not None and resp.status_code == 429:
             self._warn("bg-429", "[SignalVault] Rate limited (429): audit events are being dropped.")
-        elif resp is not None and self._config.debug:
-            warnings.warn(f"[SignalVault] Event rejected: {resp.status_code}", SignalVaultWarning)
+        elif self._config.debug:
+            status = resp.status_code if resp is not None else "no response"
+            _emit_warning(f"[SignalVault] Event not delivered: {status}", SignalVaultWarning)
 
     def _prepare_tool_call(self, opts: ToolRecordOptions) -> Optional[dict]:
         """Builds the tool_call body now, so it reflects the arguments at call time.
@@ -440,33 +489,46 @@ class _BaseSyncClient(_ClientCommon):
             json=body,
         )
 
-    def _post_background(self, body: dict) -> Optional[httpx.Response]:
-        """POST with an ``event_id`` (so a retry is never double-counted) and one retry.
+    def _post_background(
+        self, body: dict, *, event_id: bool = True, retry: bool = True,
+    ) -> Optional[httpx.Response]:
+        """POST with one retry on connection errors, 5xx, and 429 with a short Retry-After.
 
-        Retries on network errors, 5xx, and 429 with a short Retry-After.
-        Returns the last response, or None if nothing was received.
+        ``event_id`` adds an idempotency key so a retry is never double-counted;
+        it is off only for the fallback ai.request, which relies on the
+        server's request_id de-duplication (the original pre-flight may have
+        been stored before the client gave up). Timeouts are not retried: the
+        server may be slow rather than down, and a retry would hold a worker
+        twice as long. Returns the last response, or None.
         """
-        event = {"event_id": str(uuid.uuid4()), **body}
+        event = {"event_id": str(uuid.uuid4()), **body} if event_id else body
         resp: Optional[httpx.Response] = None
+        delay: Optional[float] = None
         try:
             resp = self._post(event, self._config.timeout)
             if 200 <= resp.status_code < 300:
                 return resp
+            delay = _retry_delay(resp)
+        except httpx.TimeoutException:
+            if self._config.debug:
+                traceback.print_exc()
         except httpx.HTTPError:
             if self._config.debug:
                 traceback.print_exc()
+            delay = 0.25 + random.random() * 0.5
 
-        delay = _retry_delay(resp)
-        if delay is None:
-            self._log_undelivered(resp)
-            return resp
-        time.sleep(delay)
-        try:
-            return self._post(event, self._config.timeout)
-        except httpx.HTTPError:
-            if self._config.debug:
-                traceback.print_exc()
-            return resp
+        if retry and delay is not None:
+            time.sleep(delay)
+            try:
+                resp = self._post(event, self._config.timeout)
+                if 200 <= resp.status_code < 300:
+                    return resp
+            except httpx.HTTPError:
+                if self._config.debug:
+                    traceback.print_exc()
+
+        self._log_undelivered(resp)
+        return resp
 
     def _send_request(self, request_id: str, params: dict, metadata: dict) -> Decision:
         try:
@@ -486,18 +548,25 @@ class _BaseSyncClient(_ClientCommon):
 
     def _fire_response(
         self, request_id: str, model: str, output: str,
-        prompt_tokens: int, completion_tokens: int, metadata: dict,
+        prompt_tokens: int, completion_tokens: int, metadata: dict, fallback: Any = None,
     ) -> None:
         """Submit response event to background executor — does not block caller."""
+        if fallback is _NO_AUDIT:
+            return
         self._submit(
             self._send_response_from_parts,
-            request_id, model, output, prompt_tokens, completion_tokens, metadata,
+            request_id, model, output, prompt_tokens, completion_tokens, metadata, fallback,
         )
 
     def _send_response_from_parts(
         self, request_id: str, model: str, output: str,
-        prompt_tokens: int, completion_tokens: int, metadata: dict,
+        prompt_tokens: int, completion_tokens: int, metadata: dict, fallback: Any = None,
     ) -> None:
+        if fallback is _NO_AUDIT:
+            return
+        if fallback is not None:
+            # Must land first: the server rejects an ai.response whose ai.request it has not stored.
+            self._post_background(fallback, event_id=False)
         self._post_background(self._response_body(
             request_id, model, output, prompt_tokens, completion_tokens, metadata,
         ))
@@ -535,10 +604,10 @@ class _BaseSyncClient(_ClientCommon):
             default_metadata=self._config.metadata,
             opts=opts,
         )
-        self._deliver_tool_call(body)
+        self._deliver_tool_call(body, retry=False)
 
-    def _deliver_tool_call(self, body: dict) -> None:
-        resp = self._post_background(body)
+    def _deliver_tool_call(self, body: dict, retry: bool = True) -> None:
+        resp = self._post_background(body, retry=retry)
         if resp is not None and resp.status_code != 429:
             _warn_on_client_error(resp.status_code, self._config.debug)
 
@@ -800,29 +869,46 @@ class _BaseAsyncClient(_ClientCommon):
             json=body,
         )
 
-    async def _post_background(self, body: dict) -> Optional[httpx.Response]:
-        """Async counterpart of the sync client's ``_post_background``."""
-        event = {"event_id": str(uuid.uuid4()), **body}
+    async def _post_background(
+        self, body: dict, *, event_id: bool = True, retry: bool = True,
+    ) -> Optional[httpx.Response]:
+        """POST with one retry on connection errors, 5xx, and 429 with a short Retry-After.
+
+        ``event_id`` adds an idempotency key so a retry is never double-counted;
+        it is off only for the fallback ai.request, which relies on the
+        server's request_id de-duplication (the original pre-flight may have
+        been stored before the client gave up). Timeouts are not retried: the
+        server may be slow rather than down, and a retry would hold a worker
+        twice as long. Returns the last response, or None.
+        """
+        event = {"event_id": str(uuid.uuid4()), **body} if event_id else body
         resp: Optional[httpx.Response] = None
+        delay: Optional[float] = None
         try:
             resp = await self._post(event, self._config.timeout)
             if 200 <= resp.status_code < 300:
                 return resp
+            delay = _retry_delay(resp)
+        except httpx.TimeoutException:
+            if self._config.debug:
+                traceback.print_exc()
         except httpx.HTTPError:
             if self._config.debug:
                 traceback.print_exc()
+            delay = 0.25 + random.random() * 0.5
 
-        delay = _retry_delay(resp)
-        if delay is None:
-            self._log_undelivered(resp)
-            return resp
-        await asyncio.sleep(delay)
-        try:
-            return await self._post(event, self._config.timeout)
-        except httpx.HTTPError:
-            if self._config.debug:
-                traceback.print_exc()
-            return resp
+        if retry and delay is not None:
+            await asyncio.sleep(delay)
+            try:
+                resp = await self._post(event, self._config.timeout)
+                if 200 <= resp.status_code < 300:
+                    return resp
+            except httpx.HTTPError:
+                if self._config.debug:
+                    traceback.print_exc()
+
+        self._log_undelivered(resp)
+        return resp
 
     async def _send_request(self, request_id: str, params: dict, metadata: dict) -> Decision:
         try:
@@ -842,8 +928,13 @@ class _BaseAsyncClient(_ClientCommon):
 
     async def _send_response_from_parts(
         self, request_id: str, model: str, output: str,
-        prompt_tokens: int, completion_tokens: int, metadata: dict,
+        prompt_tokens: int, completion_tokens: int, metadata: dict, fallback: Any = None,
     ) -> None:
+        if fallback is _NO_AUDIT:
+            return
+        if fallback is not None:
+            # Must land first: the server rejects an ai.response whose ai.request it has not stored.
+            await self._post_background(fallback, event_id=False)
         await self._post_background(self._response_body(
             request_id, model, output, prompt_tokens, completion_tokens, metadata,
         ))
@@ -867,10 +958,10 @@ class _BaseAsyncClient(_ClientCommon):
             default_metadata=self._config.metadata,
             opts=opts,
         )
-        await self._deliver_tool_call(body)
+        await self._deliver_tool_call(body, retry=False)
 
-    async def _deliver_tool_call(self, body: dict) -> None:
-        resp = await self._post_background(body)
+    async def _deliver_tool_call(self, body: dict, retry: bool = True) -> None:
+        resp = await self._post_background(body, retry=retry)
         if resp is not None and resp.status_code != 429:
             _warn_on_client_error(resp.status_code, self._config.debug)
 
@@ -1020,6 +1111,7 @@ class _ChatCompletions:
         decision = self._sv._send_request(request_id, kwargs, metadata)
 
         self._sv._enforce(request_id, decision)
+        fallback = self._sv._fallback_request(decision, request_id, kwargs, metadata)
 
         if stream and "stream_options" not in kwargs:
             kwargs["stream_options"] = {"include_usage": True}
@@ -1027,14 +1119,14 @@ class _ChatCompletions:
         response = self._sv._openai.chat.completions.create(**kwargs)
 
         if stream:
-            return self._wrap_stream(request_id, kwargs, response, metadata, mirror=False)
+            return self._wrap_stream(request_id, kwargs, response, metadata, mirror=False, fallback=fallback)
 
         self._sv._fire_response(
             request_id, kwargs.get("model", ""),
             (response.choices[0].message.content or "") if response.choices else "",
             response.usage.prompt_tokens if response.usage else 0,
             response.usage.completion_tokens if response.usage else 0,
-            metadata,
+            metadata, fallback=fallback,
         )
         return response
 
@@ -1058,7 +1150,7 @@ class _ChatCompletions:
 
     def _wrap_stream(
         self, request_id: str, kwargs: dict, stream: Any,
-        metadata: dict, mirror: bool,
+        metadata: dict, mirror: bool, fallback: Any = None,
     ) -> Generator[Any, None, None]:
         chunks: List[str] = []
         prompt_tokens = 0
@@ -1083,7 +1175,7 @@ class _ChatCompletions:
                 )
             else:
                 self._sv._fire_response(
-                    request_id, model, output, prompt_tokens, completion_tokens, metadata,
+                    request_id, model, output, prompt_tokens, completion_tokens, metadata, fallback=fallback,
                 )
 
 
@@ -1176,6 +1268,7 @@ class _AsyncChatCompletions:
         decision = await self._sv._send_request(request_id, kwargs, metadata)
 
         self._sv._enforce(request_id, decision)
+        fallback = self._sv._fallback_request(decision, request_id, kwargs, metadata)
 
         if stream and "stream_options" not in kwargs:
             kwargs["stream_options"] = {"include_usage": True}
@@ -1183,7 +1276,7 @@ class _AsyncChatCompletions:
         response = await self._sv._openai.chat.completions.create(**kwargs)
 
         if stream:
-            return self._wrap_stream(request_id, kwargs, response, metadata, mirror=False)
+            return self._wrap_stream(request_id, kwargs, response, metadata, mirror=False, fallback=fallback)
 
         self._sv._spawn(
             self._sv._send_response_from_parts(
@@ -1191,7 +1284,7 @@ class _AsyncChatCompletions:
                 (response.choices[0].message.content or "") if response.choices else "",
                 response.usage.prompt_tokens if response.usage else 0,
                 response.usage.completion_tokens if response.usage else 0,
-                metadata,
+                metadata, fallback=fallback,
             )
         )
         return response
@@ -1218,7 +1311,7 @@ class _AsyncChatCompletions:
 
     async def _wrap_stream(
         self, request_id: str, kwargs: dict, stream: Any,
-        metadata: dict, mirror: bool,
+        metadata: dict, mirror: bool, fallback: Any = None,
     ) -> AsyncGenerator[Any, None]:
         chunks: List[str] = []
         prompt_tokens = 0
@@ -1243,7 +1336,7 @@ class _AsyncChatCompletions:
                 )
                 if mirror else
                 self._sv._send_response_from_parts(
-                    request_id, model, output, prompt_tokens, completion_tokens, metadata,
+                    request_id, model, output, prompt_tokens, completion_tokens, metadata, fallback=fallback,
                 )
             )
             self._sv._spawn(coro)
@@ -1336,12 +1429,13 @@ class _AnthropicMessages:
         decision = self._sv._send_request(request_id, kwargs, metadata)
 
         self._sv._enforce(request_id, decision)
+        fallback = self._sv._fallback_request(decision, request_id, kwargs, metadata)
 
         if stream:
             # Use the streaming context manager to get a proper event iterator
             kwargs.pop("stream", None)
             stream_ctx = self._sv._anthropic.messages.stream(**kwargs)
-            return self._wrap_stream(request_id, kwargs, stream_ctx, metadata, mirror=False)
+            return self._wrap_stream(request_id, kwargs, stream_ctx, metadata, mirror=False, fallback=fallback)
 
         response = self._sv._anthropic.messages.create(**kwargs)
         self._sv._fire_response(
@@ -1349,7 +1443,7 @@ class _AnthropicMessages:
             _anthropic_output_text(response),
             response.usage.input_tokens if response.usage else 0,
             response.usage.output_tokens if response.usage else 0,
-            metadata,
+            metadata, fallback=fallback,
         )
         return response
 
@@ -1371,7 +1465,7 @@ class _AnthropicMessages:
 
     def _wrap_stream(
         self, request_id: str, kwargs: dict, stream_ctx: Any,
-        metadata: dict, mirror: bool,
+        metadata: dict, mirror: bool, fallback: Any = None,
     ) -> Generator[Any, None, None]:
         chunks: List[str] = []
         input_tokens = 0
@@ -1401,7 +1495,7 @@ class _AnthropicMessages:
                 )
             else:
                 self._sv._fire_response(
-                    request_id, model, output, input_tokens, output_tokens, metadata,
+                    request_id, model, output, input_tokens, output_tokens, metadata, fallback=fallback,
                 )
 
 
@@ -1500,11 +1594,12 @@ class _AsyncAnthropicMessages:
         decision = await self._sv._send_request(request_id, kwargs, metadata)
 
         self._sv._enforce(request_id, decision)
+        fallback = self._sv._fallback_request(decision, request_id, kwargs, metadata)
 
         if stream:
             kwargs.pop("stream", None)
             stream_ctx = self._sv._anthropic.messages.stream(**kwargs)
-            return self._wrap_stream(request_id, kwargs, stream_ctx, metadata, mirror=False)
+            return self._wrap_stream(request_id, kwargs, stream_ctx, metadata, mirror=False, fallback=fallback)
 
         response = await self._sv._anthropic.messages.create(**kwargs)
         self._sv._spawn(
@@ -1513,7 +1608,7 @@ class _AsyncAnthropicMessages:
                 _anthropic_output_text(response),
                 response.usage.input_tokens if response.usage else 0,
                 response.usage.output_tokens if response.usage else 0,
-                metadata,
+                metadata, fallback=fallback,
             )
         )
         return response
@@ -1538,7 +1633,7 @@ class _AsyncAnthropicMessages:
 
     async def _wrap_stream(
         self, request_id: str, kwargs: dict, stream_ctx: Any,
-        metadata: dict, mirror: bool,
+        metadata: dict, mirror: bool, fallback: Any = None,
     ) -> AsyncGenerator[Any, None]:
         chunks: List[str] = []
         input_tokens = 0
@@ -1568,7 +1663,7 @@ class _AsyncAnthropicMessages:
                 )
                 if mirror else
                 self._sv._send_response_from_parts(
-                    request_id, model, output, input_tokens, output_tokens, metadata,
+                    request_id, model, output, input_tokens, output_tokens, metadata, fallback=fallback,
                 )
             )
             self._sv._spawn(coro)
