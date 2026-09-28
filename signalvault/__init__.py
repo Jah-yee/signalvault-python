@@ -6,11 +6,14 @@ from .client import (
     AsyncSignalVaultClient,
     SignalVaultClient,
 )
+from .tools import ToolContext, ToolRecordOptions
 
 __all__ = [
     "SignalVaultClient",
     "AsyncSignalVaultClient",
     "AnthropicSignalVaultClient",
     "AsyncAnthropicSignalVaultClient",
+    "ToolContext",
+    "ToolRecordOptions",
 ]
-__version__ = "0.3.0"
+__version__ = "0.4.0"

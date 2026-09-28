@@ -4,14 +4,25 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import functools
+import inspect
+import time
 import traceback
 import uuid
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any, AsyncGenerator, Dict, Generator, List, Optional
+from datetime import datetime, timezone
+from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, Generator, List, Optional
 
 import httpx
+
+from .tools import (
+    ToolContext,
+    ToolRecordOptions,
+    build_tool_call_body,
+    get_current_request_id,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -227,6 +238,218 @@ class _BaseSyncClient:
             if self._config.debug:
                 traceback.print_exc()
 
+    # -- Agent tool-use capture ---------------------------------------------
+
+    def _send_tool_call_event(self, opts: ToolRecordOptions) -> None:
+        """Blocking POST of an agent.tool_call event. Surfaces 4xx via warnings.
+
+        Used by the manual API (``client.tools.record``) directly and by the
+        wrapper indirectly via the background executor.
+        """
+        body = build_tool_call_body(
+            environment=self._config.environment,
+            default_metadata=self._config.metadata,
+            opts=opts,
+        )
+        try:
+            resp = self._http.post(
+                f"{self._config.base_url}/v1/events",
+                headers=self._headers(),
+                timeout=self._config.timeout,
+                json=body,
+            )
+            _warn_on_client_error(resp.status_code, self._config.debug)
+        except (httpx.TimeoutException, httpx.RequestError):
+            if self._config.debug:
+                traceback.print_exc()
+
+    def _fire_tool_call(self, opts: ToolRecordOptions) -> None:
+        """Submit a tool_call event to the background executor. Non-blocking."""
+        _BACKGROUND_EXECUTOR.submit(self._send_tool_call_event, opts)
+
+    @property
+    def tools(self) -> "_SyncToolsAPI":
+        """Manual tool-call recording API. ``client.tools.record(...)``."""
+        return _SyncToolsAPI(self)
+
+    def with_context(self, *, request_id: str) -> ToolContext:
+        """Returns a context manager scoping ``request_id`` for tool correlation.
+
+        Usable as both ``with client.with_context(request_id=...)`` and
+        ``async with client.with_context(request_id=...)``.
+        """
+        return ToolContext(request_id)
+
+    def tool(
+        self,
+        name: str,
+        fn: Optional[Callable[..., Any]] = None,
+        *,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Callable[..., Any]:
+        """Wraps a sync or async callable so each call records an agent.tool_call.
+
+        Two call shapes — both are equivalent::
+
+            wrapped = client.tool("fetch_weather", fetch_weather)
+            wrapped = client.tool("fetch_weather")(fetch_weather)  # decorator
+
+        For async functions used inside an async runtime, prefer
+        :class:`AsyncSignalVaultClient.tool` — sync clients submit recording to
+        a background thread, which is fine but blocks the event loop briefly
+        when serializing arguments.
+        """
+
+        def decorator(inner: Callable[..., Any]) -> Callable[..., Any]:
+            if inspect.iscoroutinefunction(inner):
+                # Async fn through a sync client — return an async wrapper.
+                @functools.wraps(inner)
+                async def async_wrapped(*args: Any, **kwargs: Any) -> Any:
+                    started_at, start = _start_timing()
+                    request_id = get_current_request_id()
+                    try:
+                        result = await inner(*args, **kwargs)
+                        self._fire_tool_call(_build_opts(
+                            name, args, kwargs, result, None,
+                            start, started_at, request_id, metadata,
+                        ))
+                        return result
+                    except Exception as exc:
+                        self._fire_tool_call(_build_opts(
+                            name, args, kwargs, None, exc,
+                            start, started_at, request_id, metadata,
+                        ))
+                        raise
+
+                return async_wrapped
+
+            @functools.wraps(inner)
+            def sync_wrapped(*args: Any, **kwargs: Any) -> Any:
+                started_at, start = _start_timing()
+                request_id = get_current_request_id()
+                try:
+                    result = inner(*args, **kwargs)
+                    self._fire_tool_call(_build_opts(
+                        name, args, kwargs, result, None,
+                        start, started_at, request_id, metadata,
+                    ))
+                    return result
+                except Exception as exc:
+                    self._fire_tool_call(_build_opts(
+                        name, args, kwargs, None, exc,
+                        start, started_at, request_id, metadata,
+                    ))
+                    raise
+
+            return sync_wrapped
+
+        if fn is None:
+            return decorator
+        return decorator(fn)
+
+
+class _SyncToolsAPI:
+    """Manual tool-call API exposed via ``client.tools``."""
+
+    __slots__ = ("_client",)
+
+    def __init__(self, client: "_BaseSyncClient") -> None:
+        self._client = client
+
+    def record(
+        self,
+        *,
+        tool_name: str,
+        tool_input: Any = None,
+        tool_output: Any = None,
+        duration_ms: int = 0,
+        error: Optional[str] = None,
+        started_at: Optional[str] = None,
+        request_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Synchronously POST an agent.tool_call event. Surfaces errors.
+
+        ``tool_name`` is required and validated (raises ``ValueError`` if
+        empty or non-string). ``request_id`` falls back to the surrounding
+        ``with_context`` block when omitted.
+        """
+        opts = ToolRecordOptions(
+            tool_name=tool_name,
+            tool_input=tool_input,
+            tool_output=tool_output,
+            duration_ms=duration_ms,
+            error=error,
+            started_at=started_at,
+            request_id=request_id if request_id is not None else get_current_request_id(),
+            metadata=metadata,
+        )
+        self._client._send_tool_call_event(opts)
+
+
+# ---------------------------------------------------------------------------
+# Helpers shared by sync and async tool wrappers
+# ---------------------------------------------------------------------------
+
+def _start_timing() -> tuple[str, float]:
+    """Returns (iso8601_started_at, monotonic_start_seconds)."""
+    return datetime.now(tz=timezone.utc).isoformat(), time.monotonic()
+
+
+def _build_opts(
+    name: str,
+    args: tuple,
+    kwargs: dict,
+    result: Any,
+    exc: Optional[BaseException],
+    start: float,
+    started_at: str,
+    request_id: Optional[str],
+    metadata: Optional[Dict[str, Any]],
+) -> ToolRecordOptions:
+    duration_ms = int((time.monotonic() - start) * 1000)
+    return ToolRecordOptions(
+        tool_name=name,
+        tool_input=_serialize_args(args, kwargs),
+        tool_output=None if exc is not None else result,
+        duration_ms=duration_ms,
+        error=None if exc is None else (str(exc) if not isinstance(exc, str) else exc),
+        started_at=started_at,
+        request_id=request_id,
+        metadata=metadata,
+    )
+
+
+def _serialize_args(args: tuple, kwargs: dict) -> Any:
+    """Mirrors Node's serializeArgs.
+
+    - No args → None
+    - Single positional arg, no kwargs → that value directly (avoids ``[obj]``)
+    - kwargs but no positional → the kwargs dict
+    - Otherwise → ``{"args": [...], "kwargs": {...}}``
+    """
+    if not args and not kwargs:
+        return None
+    if len(args) == 1 and not kwargs:
+        return args[0]
+    if not args and kwargs:
+        return dict(kwargs)
+    return {"args": list(args), "kwargs": dict(kwargs)}
+
+
+def _warn_on_client_error(status_code: int, debug: bool) -> None:
+    """4xx → unconditional ``warnings.warn``; 5xx → only when debug=True."""
+    if 200 <= status_code < 300:
+        return
+    if 400 <= status_code < 500:
+        warnings.warn(
+            f"[SignalVault] tool_call rejected with {status_code}. "
+            f"Check your api_key and event payload.",
+            stacklevel=3,
+        )
+    elif debug:
+        warnings.warn(f"[SignalVault] tool_call event failed: {status_code}")
+
 
 # ---------------------------------------------------------------------------
 # Base async client — shared HTTP logic for OpenAI and Anthropic async clients
@@ -352,6 +575,152 @@ class _BaseAsyncClient:
         except Exception:
             if self._config.debug:
                 traceback.print_exc()
+
+    # -- Agent tool-use capture ---------------------------------------------
+
+    async def _send_tool_call_event(self, opts: ToolRecordOptions) -> None:
+        """Awaitable POST of an agent.tool_call event. Surfaces 4xx via warnings."""
+        body = build_tool_call_body(
+            environment=self._config.environment,
+            default_metadata=self._config.metadata,
+            opts=opts,
+        )
+        try:
+            resp = await self._http.post(
+                f"{self._config.base_url}/v1/events",
+                headers=self._headers(),
+                timeout=self._config.timeout,
+                json=body,
+            )
+            _warn_on_client_error(resp.status_code, self._config.debug)
+        except (httpx.TimeoutException, httpx.RequestError):
+            if self._config.debug:
+                traceback.print_exc()
+
+    def _fire_tool_call(self, opts: ToolRecordOptions) -> None:
+        """Schedule a tool_call audit on the running event loop. Non-blocking.
+
+        If no event loop is running (called from sync code) we silently drop —
+        async clients are expected to be used from async code.
+        """
+        try:
+            asyncio.create_task(self._send_tool_call_event(opts))
+        except RuntimeError:
+            # Loop closed or not running — best-effort.
+            pass
+
+    @property
+    def tools(self) -> "_AsyncToolsAPI":
+        """Manual async tool-call recording API. ``await client.tools.record(...)``."""
+        return _AsyncToolsAPI(self)
+
+    def with_context(self, *, request_id: str) -> ToolContext:
+        """Returns a context manager scoping ``request_id`` for tool correlation.
+
+        Use as ``async with client.with_context(request_id=...):`` from async
+        code.
+        """
+        return ToolContext(request_id)
+
+    def tool(
+        self,
+        name: str,
+        fn: Optional[Callable[..., Awaitable[Any]]] = None,
+        *,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Callable[..., Any]:
+        """Wraps an async (or sync) callable so each call records an agent.tool_call.
+
+        The audit POST is fire-and-forget via ``asyncio.create_task`` so the
+        wrapped function's latency isn't affected by SignalVault's network call.
+
+        If ``inner`` is a sync function, it is invoked inline inside the async
+        wrapper and will briefly block the event loop. For CPU-bound or
+        long-running sync work prefer ``run_in_executor`` or use the sync
+        :class:`SignalVaultClient`.
+        """
+
+        def decorator(inner: Callable[..., Any]) -> Callable[..., Any]:
+            if inspect.iscoroutinefunction(inner):
+                @functools.wraps(inner)
+                async def async_wrapped(*args: Any, **kwargs: Any) -> Any:
+                    started_at, start = _start_timing()
+                    request_id = get_current_request_id()
+                    try:
+                        result = await inner(*args, **kwargs)
+                        self._fire_tool_call(_build_opts(
+                            name, args, kwargs, result, None,
+                            start, started_at, request_id, metadata,
+                        ))
+                        return result
+                    except Exception as exc:
+                        self._fire_tool_call(_build_opts(
+                            name, args, kwargs, None, exc,
+                            start, started_at, request_id, metadata,
+                        ))
+                        raise
+
+                return async_wrapped
+
+            # Sync fn through async client — wrap it as async so the wrapper
+            # signature is uniform for callers of an AsyncSignalVaultClient.
+            @functools.wraps(inner)
+            async def sync_wrapped(*args: Any, **kwargs: Any) -> Any:
+                started_at, start = _start_timing()
+                request_id = get_current_request_id()
+                try:
+                    result = inner(*args, **kwargs)
+                    self._fire_tool_call(_build_opts(
+                        name, args, kwargs, result, None,
+                        start, started_at, request_id, metadata,
+                    ))
+                    return result
+                except Exception as exc:
+                    self._fire_tool_call(_build_opts(
+                        name, args, kwargs, None, exc,
+                        start, started_at, request_id, metadata,
+                    ))
+                    raise
+
+            return sync_wrapped
+
+        if fn is None:
+            return decorator
+        return decorator(fn)
+
+
+class _AsyncToolsAPI:
+    """Async manual tool-call API exposed via ``client.tools``."""
+
+    __slots__ = ("_client",)
+
+    def __init__(self, client: "_BaseAsyncClient") -> None:
+        self._client = client
+
+    async def record(
+        self,
+        *,
+        tool_name: str,
+        tool_input: Any = None,
+        tool_output: Any = None,
+        duration_ms: int = 0,
+        error: Optional[str] = None,
+        started_at: Optional[str] = None,
+        request_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Awaitable manual recording. Surfaces errors back to the caller."""
+        opts = ToolRecordOptions(
+            tool_name=tool_name,
+            tool_input=tool_input,
+            tool_output=tool_output,
+            duration_ms=duration_ms,
+            error=error,
+            started_at=started_at,
+            request_id=request_id if request_id is not None else get_current_request_id(),
+            metadata=metadata,
+        )
+        await self._client._send_tool_call_event(opts)
 
 
 # ---------------------------------------------------------------------------

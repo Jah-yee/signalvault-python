@@ -110,6 +110,89 @@ for event in stream:
         print(event.delta.text or "", end="", flush=True)
 ```
 
+## Agent Tool-Use Capture
+
+Log every tool invocation made by your agents — name, input, output, duration, and any error — as auditable events alongside your LLM calls.
+
+### Wrapper API (recommended)
+
+```python
+@client.tool("fetch_weather")
+def fetch_weather(city: str):
+    res = httpx.get(f"https://api.example.com/weather?city={city}")
+    return res.json()
+
+# Call it like the original — SignalVault auto-times and audits.
+weather = fetch_weather("London")
+```
+
+The wrapper records the call asynchronously (no impact on your tool's latency) and passes the result through unchanged. Errors are recorded and re-raised.
+
+```python
+# Async client + async tool
+@async_client.tool("fetch_weather")
+async def fetch_weather(city: str):
+    async with httpx.AsyncClient() as http:
+        res = await http.get(f"https://api.example.com/weather?city={city}")
+        return res.json()
+
+weather = await fetch_weather("London")
+```
+
+### Manual API
+
+```python
+# Sync — blocks on the HTTP send so errors surface to the caller
+client.tools.record(
+    tool_name="fetch_weather",
+    tool_input={"city": "London"},
+    tool_output={"temp": 12.3},
+    duration_ms=142,
+)
+
+# Async
+await async_client.tools.record(
+    tool_name="fetch_weather",
+    tool_input={"city": "London"},
+    tool_output={"temp": 12.3},
+    duration_ms=142,
+)
+```
+
+### Linking tool calls to a parent LLM turn
+
+Wrap your agent loop in `with_context` and tool calls inside auto-correlate to the given `request_id`:
+
+```python
+# Sync
+with client.with_context(request_id="agent-turn-abc"):
+    llm_response = client.chat.completions.create(...)
+    fetch_weather("London")  # auto-linked to 'agent-turn-abc'
+
+# Async
+async with async_client.with_context(request_id="agent-turn-abc"):
+    llm_response = await async_client.chat.completions.create(...)
+    await fetch_weather("London")  # auto-linked to 'agent-turn-abc'
+```
+
+Without `with_context`, tool calls are recorded as orphans (no parent request).
+
+### What gets captured (and what to keep out)
+
+When you wrap a tool or call `tools.record()`, SignalVault captures:
+
+- `tool_name` (truncated to 200 bytes)
+- `tool_input` — the function arguments, JSON-serialized (capped at 256 KB; oversize values are truncated with a marker)
+- `tool_output` — the function return value, JSON-serialized (same 256 KB cap)
+- `error` if the tool raises (truncated to 1900 bytes)
+- `duration_ms`, `started_at`, and any `metadata` you attach
+
+These fields are stored encrypted at rest server-side, but they go on the wire to SignalVault's API. **If you pass user PII, secrets, or API keys as tool arguments, those values will leave your process and be stored in SignalVault.** Recommendations:
+
+- Sanitize sensitive arguments before invoking the wrapped tool, or use the manual `tools.record()` API and pass a redacted copy.
+- Don't put secrets in error messages — they end up in `error` verbatim.
+- Use `metadata` for non-sensitive identifiers (`user_id`, `feature`, `workspace_id`); avoid putting raw user content in metadata.
+
 ## Metadata
 
 Attach contextual metadata to every event for user attribution, analytics, and audit trails:
