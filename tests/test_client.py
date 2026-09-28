@@ -4,6 +4,7 @@ import pytest
 import warnings
 from unittest.mock import MagicMock, patch, AsyncMock
 from signalvault import (
+    SignalVaultWarning,
     SignalVaultClient,
     AsyncSignalVaultClient,
     AnthropicSignalVaultClient,
@@ -25,7 +26,8 @@ class TestSignalVaultClientConstruction:
 
     def test_defaults(self):
         client = SignalVaultClient(api_key="sk_test_abc", openai_api_key="sk-fake")
-        assert client._config.base_url == "http://localhost:4000"
+        assert client._config.base_url == "https://api.signalvault.io"
+        assert client._config.fail_mode == "open"
         assert client._config.environment == "production"
         assert client._config.debug is False
         assert client._config.mirror_mode is False
@@ -133,7 +135,8 @@ class TestTimeout:
             base_url="http://127.0.0.1:1",  # unreachable
             preflight_timeout=0.1,
         )
-        decision = client._send_request("req-1", {"model": "gpt-4", "messages": []}, {})
+        with pytest.warns(SignalVaultWarning, match="NOT applied"):
+            decision = client._send_request("req-1", {"model": "gpt-4", "messages": []}, {})
         assert decision.decision == "allow"
         assert decision.violations == []
 
@@ -188,45 +191,33 @@ class TestSvMetadata:
         assert "sv_metadata" not in captured_oai_kwargs
         assert captured_request_metadata == {"env": "prod", "tool": "clip_detect"}
 
-    def test_metadata_deprecated_fires_without_debug(self):
-        """Old 'metadata' kwarg triggers DeprecationWarning regardless of debug mode."""
-        client = SignalVaultClient(
-            api_key="sk_test", openai_api_key="sk-fake", debug=False,
-        )
+    def test_provider_metadata_passes_through(self):
+        """`metadata` belongs to OpenAI (stored completions) and is forwarded untouched."""
+        client = SignalVaultClient(api_key="sk_test", openai_api_key="sk-fake")
         fake_response = MagicMock()
         fake_response.choices = [MagicMock()]
         fake_response.choices[0].message.content = "hello"
         fake_response.usage = MagicMock(prompt_tokens=5, completion_tokens=10)
+        captured_request_metadata = {}
 
-        with patch.object(client._openai.chat.completions, "create", return_value=fake_response), \
-             patch.object(client, "_send_request", return_value=Decision()), \
+        def fake_send_request(request_id, params, metadata):
+            captured_request_metadata.update(metadata)
+            return Decision()
+
+        with patch.object(client._openai.chat.completions, "create", return_value=fake_response) as oai, \
+             patch.object(client, "_send_request", side_effect=fake_send_request), \
              patch.object(client, "_fire_response"), \
-             pytest.warns(DeprecationWarning, match="sv_metadata"):
+             warnings.catch_warnings():
+            warnings.simplefilter("error", DeprecationWarning)
             client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[{"role": "user", "content": "hi"}],
-                metadata={"tool": "old_way"},
+                metadata={"purpose": "eval"},
+                sv_metadata={"tool": "x"},
             )
 
-    def test_metadata_deprecated_fires_with_debug(self):
-        """Old 'metadata' kwarg triggers DeprecationWarning in debug mode too."""
-        client = SignalVaultClient(
-            api_key="sk_test", openai_api_key="sk-fake", debug=True,
-        )
-        fake_response = MagicMock()
-        fake_response.choices = [MagicMock()]
-        fake_response.choices[0].message.content = "hello"
-        fake_response.usage = MagicMock(prompt_tokens=5, completion_tokens=10)
-
-        with patch.object(client._openai.chat.completions, "create", return_value=fake_response), \
-             patch.object(client, "_send_request", return_value=Decision()), \
-             patch.object(client, "_fire_response"), \
-             pytest.warns(DeprecationWarning, match="sv_metadata"):
-            client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": "hi"}],
-                metadata={"tool": "old_way"},
-            )
+        assert oai.call_args.kwargs["metadata"] == {"purpose": "eval"}
+        assert captured_request_metadata == {"tool": "x"}
 
 
 # ---------------------------------------------------------------------------
@@ -489,7 +480,8 @@ class TestAsyncSignalVaultClient:
             base_url="http://127.0.0.1:1",
             preflight_timeout=0.1,
         )
-        decision = await client._send_request("req-1", {"model": "gpt-4", "messages": []}, {})
+        with pytest.warns(SignalVaultWarning, match="NOT applied"):
+            decision = await client._send_request("req-1", {"model": "gpt-4", "messages": []}, {})
         assert decision.decision == "allow"
 
 
@@ -546,30 +538,31 @@ class TestAnthropicSignalVaultClient:
                 base_url="http://127.0.0.1:1",
                 preflight_timeout=0.1,
             )
-            decision = client._send_request("req-1", {"model": "claude-3-5-sonnet-20241022", "messages": []}, {})
+            with pytest.warns(SignalVaultWarning, match="NOT applied"):
+                decision = client._send_request("req-1", {"model": "claude-3-5-sonnet-20241022", "messages": []}, {})
             assert decision.decision == "allow"
 
-    def test_deprecated_metadata_fires_without_debug(self):
+    def test_provider_metadata_passes_through(self):
+        """Anthropic's `metadata={"user_id": ...}` reaches Anthropic instead of being taken over."""
         mock_anthropic = MagicMock()
         mock_anthropic.Anthropic = MagicMock(return_value=MagicMock())
         with patch.dict("sys.modules", {"anthropic": mock_anthropic}):
-            client = AnthropicSignalVaultClient(
-                api_key="sk_test", anthropic_api_key="sk-ant-fake", debug=False
-            )
+            client = AnthropicSignalVaultClient(api_key="sk_test", anthropic_api_key="sk-ant-fake")
             fake_response = MagicMock()
-            fake_response.content = [MagicMock(text="hi")]
+            fake_response.content = [MagicMock(type="text", text="hi")]
             fake_response.usage = MagicMock(input_tokens=5, output_tokens=10)
 
-            with patch.object(client._anthropic.messages, "create", return_value=fake_response), \
+            with patch.object(client._anthropic.messages, "create", return_value=fake_response) as create, \
                  patch.object(client, "_send_request", return_value=Decision()), \
-                 patch.object(client, "_fire_response"), \
-                 pytest.warns(DeprecationWarning, match="sv_metadata"):
+                 patch.object(client, "_fire_response"):
                 client.messages.create(
                     model="claude-3-5-sonnet-20241022",
                     messages=[{"role": "user", "content": "hi"}],
                     max_tokens=100,
-                    metadata={"tool": "old_way"},
+                    metadata={"user_id": "end-user-42"},
                 )
+
+            assert create.call_args.kwargs["metadata"] == {"user_id": "end-user-42"}
 
 
 # ---------------------------------------------------------------------------
@@ -614,7 +607,8 @@ class TestAsyncAnthropicSignalVaultClient:
                 base_url="http://127.0.0.1:1",
                 preflight_timeout=0.1,
             )
-            decision = await client._send_request(
-                "req-1", {"model": "claude-3-5-sonnet-20241022", "messages": []}, {}
-            )
+            with pytest.warns(SignalVaultWarning, match="NOT applied"):
+                decision = await client._send_request(
+                    "req-1", {"model": "claude-3-5-sonnet-20241022", "messages": []}, {}
+                )
             assert decision.decision == "allow"
