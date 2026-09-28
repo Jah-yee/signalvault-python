@@ -187,10 +187,10 @@ When you wrap a tool or call `tools.record()`, SignalVault captures:
 - `error` if the tool raises (truncated to 1900 bytes)
 - `duration_ms`, `started_at`, and any `metadata` you attach
 
-These fields are stored encrypted at rest server-side, but they go on the wire to SignalVault's API. **If you pass user PII, secrets, or API keys as tool arguments, those values will leave your process and be stored in SignalVault.** Recommendations:
+`tool_input` and `tool_output` are encrypted at rest server-side. `tool_name`, `error`, `started_at` and `metadata` are stored as sent, **not encrypted**. All of it goes on the wire to SignalVault's API: **if you pass user PII, secrets, or API keys as tool arguments, those values will leave your process and be stored in SignalVault.** Recommendations:
 
 - Sanitize sensitive arguments before invoking the wrapped tool, or use the manual `tools.record()` API and pass a redacted copy.
-- Don't put secrets in error messages — they end up in `error` verbatim.
+- Don't put secrets in error messages — they end up in `error` verbatim and unencrypted.
 - Use `metadata` for non-sensitive identifiers (`user_id`, `feature`, `workspace_id`); avoid putting raw user content in metadata.
 
 ## Metadata
@@ -209,22 +209,66 @@ client = SignalVaultClient(
 response = client.chat.completions.create(
     model="gpt-4",
     messages=[...],
-    metadata={"user_id": "u_123", "feature": "support-chat"},
+    sv_metadata={"user_id": "u_123", "feature": "support-chat"},
 )
 ```
 
-## Timeout Configuration
+`sv_metadata` goes to SignalVault. A plain `metadata=` argument is passed through to the provider untouched (for example Anthropic's `metadata={"user_id": ...}`).
 
-The pre-flight guardrail check is in your request's critical path. SignalVault uses a short timeout and **fails open** — your request always goes through even if the SignalVault API is unreachable:
+## When SignalVault Is Unavailable
+
+The pre-flight guardrail check is in your request's critical path. If it cannot return a decision — timeout, network error, invalid or revoked API key (401), inactive subscription (402), access denied (403), rate or trial limit (429), server error, or an invalid response — `fail_mode` decides what happens:
+
+- `"open"` (default): the request goes to the provider **without** guardrails, and the SDK emits a `SignalVaultWarning` (at most once a minute per cause, whether or not `debug` is on). If SignalVault was unreachable, timed out or errored, the request is still recorded in the background, marked `preflight_unavailable`, so it appears in your audit log.
+- `"closed"`: the SDK raises `SignalVaultUnavailableError` and the provider is never called. Use this if every request must be checked.
+
+`fail_mode` applies to the pre-flight check, so it has no effect in mirror mode.
+
+**Rate limit.** The ingest API allows 120 events per minute per app, and each call sends two (request and response), plus one per tool call. Above roughly 60 LLM calls a minute, pre-flight checks are rate limited: with `fail_mode="open"` those requests go through unchecked. If you run at that volume and need enforcement, use `fail_mode="closed"`.
 
 ```python
 client = SignalVaultClient(
     api_key="sk_live_...",
     openai_api_key=os.environ["OPENAI_API_KEY"],
-    preflight_timeout=2.0,   # seconds — pre-flight check (fails open). Default: 2.0
+    fail_mode="closed",      # "open" | "closed". Default: "open"
+    preflight_timeout=2.0,   # seconds — pre-flight check. Default: 2.0
     timeout=30.0,            # seconds — background/post-flight calls. Default: 30.0
 )
 ```
+
+`base_url` defaults to `https://api.signalvault.io`. Plain `http://` is refused except for `localhost`, as is a URL with a query string or fragment.
+
+Audit events (responses, mirror-mode events, tool calls) are sent in the background. Each carries an `event_id`, so a retry is never double-counted. The SDK retries once on connection errors and 5xx (not on timeouts). A rate-limited (429) event is retried only if `Retry-After` is 5 seconds or less; the SignalVault API currently asks for 60, so in practice those events are dropped, with a warning. `tools.record()` does not retry.
+
+## Shutting Down
+
+Background events are queued in memory. Wait for them before a short-lived process exits:
+
+```python
+client.close()          # sync: sends queued events (up to 5s), then closes the connection pool
+await client.aclose()   # async: same; required — pending async events are lost if the loop exits first
+
+# Or only wait, keeping the client open:
+client.flush()
+await async_client.flush()
+```
+
+## Error Handling
+
+```python
+from signalvault import SignalVaultBlockedError, SignalVaultUnavailableError
+
+try:
+    response = client.chat.completions.create(model="gpt-4", messages=[...])
+except SignalVaultBlockedError as e:
+    print("Blocked by guardrails:", [v.type for v in e.violations])
+    print("Details:", e.dashboard_url)
+except SignalVaultUnavailableError as e:
+    # Only raised with fail_mode="closed"
+    print("Guardrail check unavailable:", e.status)
+```
+
+Both are subclasses of `RuntimeError`.
 
 ## Mirror Mode
 
@@ -241,7 +285,8 @@ client = SignalVaultClient(
 ## Features
 
 - **Automatic Logging** — Every request and response is recorded
-- **Pre-flight Guardrails** — Block or redact requests before they reach the AI provider
+- **Pre-flight Guardrails** — Block requests that break your rules before they reach the AI provider
+- **Redaction at rest** — Rules with the `redact` action remove matches from what SignalVault stores. The request sent to the AI provider is **not** modified.
 - **PII Detection** — Detect emails, phone numbers, SSNs
 - **Secret Detection** — Block API keys and tokens
 - **Token Limits** — Enforce cost controls

@@ -30,6 +30,9 @@ from typing import Any, Dict, Optional
 MAX_PAYLOAD_BYTES: int = 256 * 1024  # 256 KB
 MAX_ERROR_BYTES: int = 1900
 MAX_TOOL_NAME_BYTES: int = 200
+# Containers nested deeper than this are replaced with a marker instead of
+# recursing until RecursionError.
+MAX_DEPTH: int = 100
 
 # ---------------------------------------------------------------------------
 # Context propagation
@@ -119,7 +122,7 @@ def sanitize_error(err: Any) -> Optional[str]:
     return _truncate_string(s, MAX_ERROR_BYTES)
 
 
-def _replace_unserializable(obj: Any, _seen: Optional[set] = None) -> Any:
+def _replace_unserializable(obj: Any, _seen: Optional[set] = None, _depth: int = 0) -> Any:
     """Walks ``obj`` and produces a JSON-safe equivalent.
 
     - Circular references → ``"[Circular]"``
@@ -127,6 +130,8 @@ def _replace_unserializable(obj: Any, _seen: Optional[set] = None) -> Any:
     - Numbers, strings, bools, None → unchanged
     - dict/list/tuple → recursive walk
     - Everything else → ``repr(value)`` so the audit still has a useful trace.
+
+    - Containers nested deeper than ``MAX_DEPTH`` → ``"[MaxDepth]"``
 
     ``set`` of object ids tracks visited containers to detect cycles.
     """
@@ -150,6 +155,9 @@ def _replace_unserializable(obj: Any, _seen: Optional[set] = None) -> Any:
         except UnicodeDecodeError:
             return f"<bytes: {len(obj)}>"
 
+    if isinstance(obj, (dict, list, tuple, set, frozenset)) and _depth >= MAX_DEPTH:
+        return "[MaxDepth]"
+
     if isinstance(obj, dict):
         oid = id(obj)
         if oid in _seen:
@@ -159,7 +167,7 @@ def _replace_unserializable(obj: Any, _seen: Optional[set] = None) -> Any:
             return {
                 # Coerce non-string keys (json requires string keys) so we don't
                 # crash on tuple/int keys.
-                (k if isinstance(k, str) else str(k)): _replace_unserializable(v, _seen)
+                (k if isinstance(k, str) else str(k)): _replace_unserializable(v, _seen, _depth + 1)
                 for k, v in obj.items()
             }
         finally:
@@ -171,7 +179,7 @@ def _replace_unserializable(obj: Any, _seen: Optional[set] = None) -> Any:
             return "[Circular]"
         _seen.add(oid)
         try:
-            return [_replace_unserializable(v, _seen) for v in obj]
+            return [_replace_unserializable(v, _seen, _depth + 1) for v in obj]
         finally:
             _seen.discard(oid)
 
@@ -195,11 +203,10 @@ def sanitize_payload(value: Any) -> Any:
     if value is None:
         return None
 
-    safe = _replace_unserializable(value)
-
     try:
+        safe = _replace_unserializable(value)
         serialized = json.dumps(safe, ensure_ascii=False)
-    except (TypeError, ValueError) as e:
+    except (TypeError, ValueError, RecursionError) as e:
         return {"_signalvault_serialization_error": str(e)}
 
     if _byte_len(serialized) <= MAX_PAYLOAD_BYTES:
