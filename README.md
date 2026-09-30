@@ -87,7 +87,8 @@ stream = client.chat.completions.create(
     stream=True,
 )
 for chunk in stream:
-    print(chunk.choices[0].delta.content or "", end="", flush=True)
+    if chunk.choices and chunk.choices[0].delta:
+        print(chunk.choices[0].delta.content or "", end="", flush=True)
 
 # OpenAI streaming (async)
 stream = await async_client.chat.completions.create(
@@ -96,7 +97,8 @@ stream = await async_client.chat.completions.create(
     stream=True,
 )
 async for chunk in stream:
-    print(chunk.choices[0].delta.content or "", end="", flush=True)
+    if chunk.choices and chunk.choices[0].delta:
+        print(chunk.choices[0].delta.content or "", end="", flush=True)
 
 # Anthropic streaming
 stream = anthropic_client.messages.create(
