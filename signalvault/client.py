@@ -371,7 +371,7 @@ class _ClientCommon:
         if decision.decision == "block":
             raise SignalVaultBlockedError(request_id, decision.violations, decision.dashboard_url)
         if decision.decision == "warn" and self._config.debug:
-            warnings.warn(f"[SignalVault] Warnings: {decision.violations}")
+            warnings.warn(f"[SignalVault] Warnings: {decision.violations}", SignalVaultWarning)
 
     def _response_body(
         self, request_id: str, model: str, output: str,
@@ -795,10 +795,11 @@ def _warn_on_client_error(status_code: int, debug: bool) -> None:
         warnings.warn(
             f"[SignalVault] tool_call rejected with {status_code}. "
             f"Check your api_key and event payload.",
+            SignalVaultWarning,
             stacklevel=3,
         )
     elif debug:
-        warnings.warn(f"[SignalVault] tool_call event failed: {status_code}")
+        warnings.warn(f"[SignalVault] tool_call event failed: {status_code}", SignalVaultWarning)
 
 
 # ---------------------------------------------------------------------------
