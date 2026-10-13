@@ -1158,9 +1158,6 @@ class _ChatCompletions:
 
         try:
             for chunk in stream:
-                delta = chunk.choices[0].delta if chunk.choices else None
-                if delta and delta.content:
-                    chunks.append(delta.content)
                 has_usage_only = (
                     hasattr(chunk, "usage") and chunk.usage and
                     (not chunk.choices or not chunk.choices[0].delta)
@@ -1170,7 +1167,13 @@ class _ChatCompletions:
                     completion_tokens = getattr(chunk.usage, "completion_tokens", 0) or 0
                     continue  # swallow usage-only chunk, matching Node SDK behaviour
                 if chunk.choices and chunk.choices[0].delta:
-                    chunks.append(chunk.choices[0].delta.content)
+                    content = chunk.choices[0].delta.content
+                    if content is not None:
+                        chunks.append(content)
+                    # Capture usage from content chunks (some providers attach usage here)
+                    if hasattr(chunk, "usage") and chunk.usage:
+                        prompt_tokens = getattr(chunk.usage, "prompt_tokens", 0) or 0
+                        completion_tokens = getattr(chunk.usage, "completion_tokens", 0) or 0
                 yield chunk
         finally:
             output = "".join(chunks)
@@ -1336,7 +1339,13 @@ class _AsyncChatCompletions:
                     completion_tokens = getattr(chunk.usage, "completion_tokens", 0) or 0
                     continue  # swallow usage-only chunk, matching Node SDK behaviour
                 if chunk.choices and chunk.choices[0].delta:
-                    chunks.append(chunk.choices[0].delta.content)
+                    content = chunk.choices[0].delta.content
+                    if content is not None:
+                        chunks.append(content)
+                    # Capture usage from content chunks (some providers attach usage here)
+                    if hasattr(chunk, "usage") and chunk.usage:
+                        prompt_tokens = getattr(chunk.usage, "prompt_tokens", 0) or 0
+                        completion_tokens = getattr(chunk.usage, "completion_tokens", 0) or 0
                 yield chunk
         finally:
             output = "".join(chunks)

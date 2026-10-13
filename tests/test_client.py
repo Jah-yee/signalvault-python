@@ -292,6 +292,72 @@ class TestStreaming:
         args = mock_fire.call_args[0]
         assert args[2] == "Hello"  # only the first chunk was accumulated
 
+    def test_streaming_handles_all_chunk_types(self):
+        """Streaming correctly handles role-only, content, finish, and usage-only chunks."""
+        client = SignalVaultClient(api_key="sk_test", openai_api_key="sk-fake")
+
+        # Helper to build chunks with full control
+        def make_chunk(role=None, content=None, finish_reason=None,
+                       prompt_tokens=None, completion_tokens=None):
+            chunk = MagicMock()
+            choices = []
+            if role is not None or content is not None or finish_reason is not None:
+                choice = MagicMock()
+                delta = MagicMock()
+                if role is not None:
+                    delta.role = role
+                if content is not None:
+                    delta.content = content
+                choice.delta = delta
+                if finish_reason is not None:
+                    choice.finish_reason = finish_reason
+                choices.append(choice)
+            chunk.choices = choices
+            if prompt_tokens is not None or completion_tokens is not None:
+                chunk.usage = MagicMock(
+                    prompt_tokens=prompt_tokens or 0,
+                    completion_tokens=completion_tokens or 0,
+                )
+            else:
+                chunk.usage = None
+            return chunk
+
+        chunks = [
+            # 1. role-only chunk (no content)
+            make_chunk(role="assistant"),
+            # 2. content chunk
+            make_chunk(content="Hello"),
+            # 3. content chunk
+            make_chunk(content=" "),
+            # 4. content chunk
+            make_chunk(content="world"),
+            # 5. finish chunk (no content, has finish_reason + usage)
+            make_chunk(finish_reason="stop", prompt_tokens=10, completion_tokens=5),
+            # 6. usage-only chunk (no choices, just usage)
+            make_chunk(prompt_tokens=10, completion_tokens=5),
+        ]
+
+        with patch.object(client, "_send_request", return_value=Decision()), \
+             patch.object(client._openai.chat.completions, "create", return_value=iter(chunks)), \
+             patch.object(client, "_fire_response") as mock_fire:
+            gen = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": "hi"}],
+                stream=True,
+            )
+            result_chunks = list(gen)
+
+        # The wrapped stream should yield non-usage-only chunks
+        # Role-only: swallowed (yielded), Content: yielded, Finish: yielded, Usage-only: swallowed
+        assert len(result_chunks) == 5  # usage-only chunk is swallowed
+
+        # _fire_response should be called with accumulated content and latest usage
+        mock_fire.assert_called_once()
+        args = mock_fire.call_args[0]
+        assert args[2] == "Hello world"  # only content chunks accumulated
+        assert args[3] == 10  # prompt_tokens from usage-only or finish chunk
+        assert args[4] == 5   # completion_tokens from usage-only or finish chunk
+
 
 # ---------------------------------------------------------------------------
 # mirror_mode
