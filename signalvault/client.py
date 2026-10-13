@@ -1158,12 +1158,22 @@ class _ChatCompletions:
 
         try:
             for chunk in stream:
-                delta = chunk.choices[0].delta if chunk.choices else None
-                if delta and delta.content:
-                    chunks.append(delta.content)
-                if hasattr(chunk, "usage") and chunk.usage:
-                    prompt_tokens = chunk.usage.prompt_tokens or 0
-                    completion_tokens = chunk.usage.completion_tokens or 0
+                has_usage_only = (
+                    hasattr(chunk, "usage") and chunk.usage and
+                    (not chunk.choices or not chunk.choices[0].delta)
+                )
+                if has_usage_only:
+                    prompt_tokens = getattr(chunk.usage, "prompt_tokens", 0) or 0
+                    completion_tokens = getattr(chunk.usage, "completion_tokens", 0) or 0
+                    continue  # swallow usage-only chunk, matching Node SDK behaviour
+                if chunk.choices and chunk.choices[0].delta:
+                    content = chunk.choices[0].delta.content
+                    if content is not None:
+                        chunks.append(content)
+                    # Capture usage from content chunks (some providers attach usage here)
+                    if hasattr(chunk, "usage") and chunk.usage:
+                        prompt_tokens = getattr(chunk.usage, "prompt_tokens", 0) or 0
+                        completion_tokens = getattr(chunk.usage, "completion_tokens", 0) or 0
                 yield chunk
         finally:
             output = "".join(chunks)
@@ -1213,7 +1223,8 @@ class SignalVaultClient(_BaseSyncClient):
             stream=True,
             sv_metadata={"tool": "stream_test"},
         ):
-            print(chunk.choices[0].delta.content or "", end="", flush=True)
+            if chunk.choices:
+                print(chunk.choices[0].delta.content or "", end="", flush=True)
 
         # Context manager (recommended for long-lived use)
         with SignalVaultClient(...) as client:
@@ -1319,12 +1330,22 @@ class _AsyncChatCompletions:
 
         try:
             async for chunk in stream:
-                delta = chunk.choices[0].delta if chunk.choices else None
-                if delta and delta.content:
-                    chunks.append(delta.content)
-                if hasattr(chunk, "usage") and chunk.usage:
-                    prompt_tokens = chunk.usage.prompt_tokens or 0
-                    completion_tokens = chunk.usage.completion_tokens or 0
+                has_usage_only = (
+                    hasattr(chunk, "usage") and chunk.usage and
+                    (not chunk.choices or not chunk.choices[0].delta)
+                )
+                if has_usage_only:
+                    prompt_tokens = getattr(chunk.usage, "prompt_tokens", 0) or 0
+                    completion_tokens = getattr(chunk.usage, "completion_tokens", 0) or 0
+                    continue  # swallow usage-only chunk, matching Node SDK behaviour
+                if chunk.choices and chunk.choices[0].delta:
+                    content = chunk.choices[0].delta.content
+                    if content is not None:
+                        chunks.append(content)
+                    # Capture usage from content chunks (some providers attach usage here)
+                    if hasattr(chunk, "usage") and chunk.usage:
+                        prompt_tokens = getattr(chunk.usage, "prompt_tokens", 0) or 0
+                        completion_tokens = getattr(chunk.usage, "completion_tokens", 0) or 0
                 yield chunk
         finally:
             output = "".join(chunks)
@@ -1374,7 +1395,8 @@ class AsyncSignalVaultClient(_BaseAsyncClient):
             messages=[{"role": "user", "content": "Count to 3"}],
             stream=True,
         ):
-            print(chunk.choices[0].delta.content or "", end="", flush=True)
+            if chunk.choices:
+                print(chunk.choices[0].delta.content or "", end="", flush=True)
 
         # Context manager (recommended)
         async with AsyncSignalVaultClient(...) as client:
